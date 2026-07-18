@@ -155,6 +155,34 @@ _print_diagnostics() {
   echo "  - dependance exige compileSdk plus recent -> sdkmanager 'platforms;android-NN'"
   echo "  - fichier .proto/genere introuvable en cours de compilation -> submodule Git"
   echo "    non initialise (verifie .gitmodules du projet, ou relance ce script)"
+  echo "  - protoc/outil telecharge tue par SIGSYS (exit 159) -> binaire glibc"
+  echo "    generique bloque par le seccomp Android (clone3) ; patch automatique"
+  echo "    tente vers l'equivalent natif Termux ; si tu vois ce message, il a echoue"
+  echo "    (verifie que 'pkg install protobuf' fonctionne)"
+}
+
+# Remplace un ou plusieurs binaires "protoc" telecharges par le plugin Gradle
+# protobuf (generiques glibc/Linux, non compiles pour Termux) par le protoc
+# natif Termux. Ces binaires generiques utilisent des appels systeme (clone3,
+# rseq) que le filtre seccomp impose par Android aux process d'application
+# bloque -> le process meurt avec SIGSYS (exit 159) des son lancement. Les
+# paquets Termux, compiles specifiquement pour cet environnement, n'ont pas
+# ce probleme.
+_patch_protoc_seccomp() {
+  if ! command -v protoc >/dev/null 2>&1; then
+    echo "  -> installation du protoc natif Termux (pkg install protobuf)..."
+    pkg install -y protobuf || {
+      echo "  echec: impossible d'installer 'protobuf' via pkg" >&2
+      return 1
+    }
+  fi
+  local native_protoc found=0 bin
+  native_protoc="$(command -v protoc)"
+  while IFS= read -r -d '' bin; do
+    ln -sf "$native_protoc" "$bin"
+    found=1
+  done < <(find "$PROJECT_DIR" -type f -path '*/build/protoc/protoc-*' -print0 2>/dev/null)
+  [ "$found" -eq 1 ]
 }
 
 if ! run_gradle; then
@@ -168,6 +196,19 @@ if ! run_gradle; then
     echo "  -> binaire build-tools x86 detecte (aidl/zipalign/aapt), patch ARM et nouvel essai..."
     source "$_ABT_DIR/patch-native-buildtools.sh"
     if patch_native_buildtools && run_gradle; then
+      : # succes au 2e essai, on continue normalement plus bas
+    else
+      _print_diagnostics
+      exit 1
+    fi
+  # Cas cible : un outil telecharge par Gradle (typiquement protoc du plugin
+  # protobuf) est un binaire glibc generique tue par le seccomp Android des
+  # son execution (SIGSYS / exit 159). On le remplace par l'equivalent natif
+  # Termux et on retente UNE fois.
+  elif grep -qiE "sigsys|exit value 159" "$_gradle_log"; then
+    echo "$(t build_retry)"
+    echo "  -> protoc/outil telecharge tue par SIGSYS (seccomp Android), bascule natif Termux et nouvel essai..."
+    if _patch_protoc_seccomp && run_gradle; then
       : # succes au 2e essai, on continue normalement plus bas
     else
       _print_diagnostics
