@@ -363,9 +363,13 @@ def run_build(jid):
         job["apk"] = apk
         job["chain"] = chain_used
         job["ended"] = time.time()
-        log(srv("finished", job.get("lang"), status=job["status"])
-            + (f" [{chain_used}]" if chain_used else "")
-            + (f" apk={apk}" if apk else ""))
+    # log() reprend JOBS_LOCK lui-meme : il ne doit JAMAIS etre appele alors
+    # que ce thread detient deja le verrou (threading.Lock n'est pas reentrant
+    # -> deadlock immediat et permanent, qui bloque aussi toutes les requetes
+    # HTTP suivantes ayant besoin de JOBS_LOCK : /jobs, /job, /logs, etc.)
+    log(srv("finished", job.get("lang"), status=job["status"])
+        + (f" [{chain_used}]" if chain_used else "")
+        + (f" apk={apk}" if apk else ""))
     _prune_jobs()
 
 def chain_status():
