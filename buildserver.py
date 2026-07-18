@@ -14,7 +14,9 @@
 #   GET  /jobs               -> historique des builds
 #   GET  /job/<job_id>       -> etat d'un job (running/success/failed + apk)
 #   GET  /apk/<job_id>       -> telecharge l'APK produit
-#   POST /setup               -> (re)lance setup-aapt2-qemu.sh
+#   POST /setup               -> (re)lance le setup de la chaine : setup-termux-native.sh
+#                                 si present (natif, cas normal), sinon setup-aapt2-qemu.sh
+#                                 (ancienne chaine proot+qemu) en repli.
 #
 # Securite : bind sur 127.0.0.1 uniquement (pas exposé au reseau). Un token
 # simple peut etre exige via l'entete X-Build-Token (voir TOKEN ci-dessous).
@@ -31,12 +33,52 @@ NATIVE_BUILDER = os.path.join(TOOLS, "build-termux-native.sh")  # chaine native 
 SETUP = os.path.join(TOOLS, "setup-aapt2-qemu.sh")
 NATIVE_SETUP = os.path.join(TOOLS, "setup-termux-native.sh")
 SHIM = os.path.join(HOME, "aapt2-shim")
-NATIVE_AAPT2 = os.path.join(HOME, "android-sdk", "build-tools", "35.0.0", "aapt2")
+GRADLE_PROPS = os.path.join(HOME, ".gradle", "gradle.properties")
+
+def native_aapt2_path():
+    """Chemin de l'aapt2 ARM natif actuellement configure.
+
+    Lit android.aapt2FromMavenOverride dans gradle.properties : c'est la
+    SEULE source de verite (c'est ce que Gradle utilise reellement), ecrite
+    par setup-termux-native.sh. Avant, ce chemin etait re-code en dur ici
+    avec le numero de version "35.0.0" duplique depuis setup-termux-native.sh
+    -- les deux fichiers devaient rester d'accord manuellement, et rien ne
+    signalait un oubli si l'un changeait sans l'autre.
+    Repli : si la ligne est absente (setup jamais lance, ou fichier different),
+    on cherche le premier aapt2 executable sous android-sdk/build-tools/*/.
+    """
+    try:
+        with open(GRADLE_PROPS, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("android.aapt2FromMavenOverride="):
+                    path = line.split("=", 1)[1].strip()
+                    if path:
+                        return path
+    except OSError:
+        pass
+    bt_root = os.path.join(HOME, "android-sdk", "build-tools")
+    try:
+        for entry in sorted(os.listdir(bt_root), reverse=True):
+            candidate = os.path.join(bt_root, entry, "aapt2")
+            if os.access(candidate, os.X_OK):
+                return candidate
+    except OSError:
+        pass
+    # Dernier repli, pour que le reste du code ait toujours une valeur.
+    return os.path.join(HOME, "android-sdk", "build-tools", "35.0.0", "aapt2")
+
 DEBIAN_ROOTFS = os.path.join(
     os.environ.get("PREFIX", "/data/data/com.termux/files/usr"),
     "var", "lib", "proot-distro", "containers", "debian")
 
 PORT = int(os.environ.get("BUILD_SERVER_PORT", "8765"))
+
+# Duree max d'un build avant qu'on le tue de force (secondes). Sans ca, un
+# gradlew bloque (daemon zombie, reseau capricieux) tournait indefiniment
+# sans que l'app APKforge n'ait d'autre moyen de le savoir que de constater
+# que les logs n'avancent plus. 45 min par defaut ; surchargeable via env.
+BUILD_TIMEOUT_SEC = int(os.environ.get("BUILD_TIMEOUT_SEC", "2700"))
 
 # token optionnel : si defini (env BUILD_SERVER_TOKEN), l'app doit l'envoyer.
 TOKEN = os.environ.get("BUILD_SERVER_TOKEN", "")
@@ -149,8 +191,39 @@ def install_debian_fallback(log):
     return False
 
 # --- etat en memoire des jobs ------------------------------------------------
+# JOBS n'est jamais vide de lui-meme : chaque build garde toutes ses lignes de
+# log indefiniment. Sur un serveur qui tourne plusieurs jours avec beaucoup de
+# builds, ca peut consommer pas mal de RAM sur un telephone. On borne donc :
+# - le nombre de jobs TERMINES conserves dans l'historique (MAX_JOBS_HISTORY)
+# - le nombre de lignes de log gardees par job termine (MAX_LOG_LINES_KEPT),
+#   en gardant le debut (contexte) et la fin (l'erreur), pas le milieu.
 JOBS = {}  # job_id -> dict(status, url, lines[], apk, started, ended)
 JOBS_LOCK = threading.Lock()
+MAX_JOBS_HISTORY = int(os.environ.get("MAX_JOBS_HISTORY", "30"))
+MAX_LOG_LINES_KEPT = int(os.environ.get("MAX_LOG_LINES_KEPT", "2000"))
+
+def _prune_jobs():
+    """A appeler quand un job se termine. Purge les jobs finis les plus
+    anciens au-dela de MAX_JOBS_HISTORY, et tronque les logs des jobs finis
+    trop longs. Le job en cours (s'il y en a un autre) n'est jamais touche."""
+    with JOBS_LOCK:
+        finished = sorted(
+            (j for j in JOBS.values() if j["status"] != "running"),
+            key=lambda j: j.get("ended") or 0,
+        )
+        excess = len(finished) - MAX_JOBS_HISTORY
+        for j in finished[:max(excess, 0)]:
+            JOBS.pop(j["id"], None)
+
+        for j in JOBS.values():
+            if j["status"] == "running":
+                continue
+            n = len(j["lines"])
+            if n > MAX_LOG_LINES_KEPT:
+                head = j["lines"][:200]
+                tail = j["lines"][-(MAX_LOG_LINES_KEPT - 200):]
+                omitted = n - len(head) - len(tail)
+                j["lines"] = head + [f"... ({omitted} lignes omises pour limiter la memoire) ..."] + tail
 
 def new_job(url, branch, subdir, task, mem=0):
     jid = uuid.uuid4().hex[:12]
@@ -165,20 +238,48 @@ def new_job(url, branch, subdir, task, mem=0):
         }
     return jid
 
-def _run_chain(job, cmd, log):
-    """Lance une commande de build, streame le log, renvoie (rc, lines_de_ce_run)."""
+def _run_chain(job, cmd, log, timeout_sec=None):
+    """Lance une commande de build, streame le log, renvoie (rc, lines_de_ce_run).
+
+    Si timeout_sec est fourni, un watchdog termine le process s'il tourne
+    encore apres ce delai (daemon Gradle bloque, reseau qui ne repond plus...)
+    au lieu de laisser le job "running" indefiniment."""
     start_idx = len(job["lines"])
     log(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+    timed_out = threading.Event()
+    watchdog = None
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, env=_script_env(job.get("lang"), job.get("mem", 0)),
         )
+
+        if timeout_sec:
+            def _kill_on_timeout():
+                timed_out.set()
+                log(f"[server] timeout ({timeout_sec}s) depasse, arret du build.")
+                try:
+                    proc.terminate()
+                    time.sleep(2)
+                    if proc.poll() is None:
+                        proc.kill()
+                except Exception:
+                    pass
+            watchdog = threading.Timer(timeout_sec, _kill_on_timeout)
+            watchdog.daemon = True
+            watchdog.start()
+
         for line in proc.stdout:
             log(line)
         proc.wait()
         rc = proc.returncode
+        if watchdog:
+            watchdog.cancel()
+        if timed_out.is_set() and rc == 0:
+            rc = 1  # tue de force : ne jamais rapporter un succes
     except Exception as e:
+        if watchdog:
+            watchdog.cancel()
         log(srv("launch_error", job.get("lang"), e=e))
         rc = 1
     with JOBS_LOCK:
@@ -211,7 +312,8 @@ def run_build(jid):
     if job["task"]:
         opts += ["--task", job["task"]]
 
-    native_ok = os.path.exists(NATIVE_BUILDER) and os.access(NATIVE_AAPT2, os.X_OK)
+    aapt2 = native_aapt2_path()
+    native_ok = os.path.exists(NATIVE_BUILDER) and os.access(aapt2, os.X_OK)
     proot_ok = os.path.exists(BUILDER) and os.path.isdir(DEBIAN_ROOTFS)
 
     rc = 1
@@ -222,7 +324,7 @@ def run_build(jid):
     if native_ok:
         log("[server] chaine NATIVE (sans qemu)")
         cmd = ["bash", NATIVE_BUILDER, job["url"]] + opts
-        rc, run_lines = _run_chain(job, cmd, log)
+        rc, run_lines = _run_chain(job, cmd, log, timeout_sec=BUILD_TIMEOUT_SEC)
         chain_used = "native"
         if rc == 0:
             do_proot = False
@@ -251,7 +353,7 @@ def run_build(jid):
     if do_proot:
         log("[server] chaine PROOT (Debian + qemu)")
         cmd = ["bash", BUILDER, job["url"]] + opts
-        rc, _ = _run_chain(job, cmd, log)
+        rc, _ = _run_chain(job, cmd, log, timeout_sec=BUILD_TIMEOUT_SEC)
         chain_used = "proot"
 
     # --- 3) APK + statut -----------------------------------------------------
@@ -264,10 +366,12 @@ def run_build(jid):
         log(srv("finished", job.get("lang"), status=job["status"])
             + (f" [{chain_used}]" if chain_used else "")
             + (f" apk={apk}" if apk else ""))
+    _prune_jobs()
 
 def chain_status():
     sdk = os.path.join(HOME, "android-sdk")
-    native_ready = os.path.exists(NATIVE_AAPT2) and os.access(NATIVE_AAPT2, os.X_OK)
+    aapt2 = native_aapt2_path()
+    native_ready = os.path.exists(aapt2) and os.access(aapt2, os.X_OK)
     proot_ready = os.path.isdir(DEBIAN_ROOTFS) and os.path.exists(BUILDER)
     return {
         # 'chain_ready' reste vrai si AU MOINS une chaine est utilisable.
@@ -276,7 +380,7 @@ def chain_status():
         "proot_ready": proot_ready,    # chaine proot Debian (qemu) en secours
         "builder_present": os.path.exists(BUILDER) or os.path.exists(NATIVE_BUILDER),
         "sdk_present": os.path.isdir(sdk),
-        "aapt2_native": NATIVE_AAPT2 if native_ready else None,
+        "aapt2_native": aapt2 if native_ready else None,
     }
 
 class Handler(BaseHTTPRequestHandler):
@@ -412,6 +516,7 @@ class Handler(BaseHTTPRequestHandler):
                 with JOBS_LOCK:
                     job["status"] = "success" if rc == 0 else "failed"
                     job["ended"] = time.time()
+                _prune_jobs()
 
             threading.Thread(target=run_setup, daemon=True).start()
             return self._send(200, {"job_id": jid})
