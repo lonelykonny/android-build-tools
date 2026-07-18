@@ -44,6 +44,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Garde-fou : une valeur commencant par '-' pourrait etre interpretee comme une
+# option par git (ex: une "URL" "--upload-pack=..." ferait executer une commande
+# arbitraire via git clone). Aucune URL/branche/sous-dossier legitime ne
+# commence par un tiret : on rejette ces valeurs plutot que de les transmettre
+# telles quelles a git.
+for _v in "$SRC" "$BRANCH" "$SUBDIR" "$TASK"; do
+  case "$_v" in
+    -*) echo "ERREUR: argument invalide (commence par '-'): $_v" >&2; exit 1 ;;
+  esac
+done
+
 # --- 1. Resoudre le projet (URL git ou chemin local) -------------------------
 if [ -d "$SRC" ]; then
   PROJECT_DIR="$SRC"

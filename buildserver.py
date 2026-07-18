@@ -392,16 +392,34 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self.headers.get("X-Build-Token", "") == TOKEN
 
+    def _from_browser(self):
+        """True si la requete porte des en-tetes que seul un navigateur ajoute
+        (Origin / Referer / Sec-Fetch-*). Le client de l'app (OkHttp) n'en
+        envoie jamais.
+
+        Le serveur n'est destine qu'a l'app APKforge (client HTTP natif) tournant
+        sur le meme telephone. Il n'a AUCUNE raison d'accepter des requetes
+        provenant d'une page web : une page ouverte dans un navigateur sur le
+        telephone (voire dans une autre appli) pourrait sinon appeler
+        127.0.0.1:8765/build a l'insu de l'utilisateur et lancer un build
+        arbitraire. On rejette donc toute requete qui ressemble a une requete
+        de navigateur, plutot que de s'appuyer uniquement sur CORS (les
+        soumissions de formulaire "simple request" contournent le CORS)."""
+        h = self.headers
+        return any(h.get(k) for k in ("Origin", "Referer", "Sec-Fetch-Site"))
+
     def _ui_lang(self):
         # Langue de l'UI APKforge, envoyee par l'app via X-Forge-Lang (ex: "fr").
         return _norm_lang(self.headers.get("X-Forge-Lang", ""))
 
     def _send(self, code, obj, ctype="application/json"):
+        # Pas de Access-Control-Allow-Origin: aucun usage legitime de ce serveur
+        # ne se fait depuis du JS de navigateur (voir _from_browser). Emettre un
+        # CORS permissif ne ferait qu'ouvrir la porte a des requetes cross-site.
         body = obj if isinstance(obj, (bytes, bytearray)) else json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -419,6 +437,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- routes --------------------------------------------------------------
     def do_GET(self):
+        if self._from_browser():
+            return self._send(403, {"error": "browser requests are not allowed"})
         if not self._auth_ok():
             return self._send(401, {"error": "unauthorized"})
         u = urlparse(self.path)
@@ -473,6 +493,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self._from_browser():
+            return self._send(403, {"error": "browser requests are not allowed"})
         if not self._auth_ok():
             return self._send(401, {"error": "unauthorized"})
         u = urlparse(self.path)
@@ -480,11 +502,20 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/build":
             body = self._read_json()
             url = (body.get("url") or "").strip()
+            branch = (body.get("branch") or "").strip()
+            subdir = (body.get("subdir") or "").strip()
+            task = (body.get("task") or "assembleDebug").strip()
             if not url:
                 return self._send(400, {"error": "url required"})
-            jid = new_job(url, body.get("branch", ""), body.get("subdir", ""),
-                          body.get("task", "assembleDebug"),
-                          body.get("mem", 0))
+            # Garde-fou : une valeur commencant par '-' pourrait etre interpretee
+            # comme une option par git ou gradlew en aval (ex: "--upload-pack=..."
+            # ou "--init-script=...") plutot que comme une URL/branche/sous-dossier/
+            # tache. Aucune valeur legitime ne commence par un tiret.
+            for name, val in (("url", url), ("branch", branch),
+                              ("subdir", subdir), ("task", task)):
+                if val.startswith("-"):
+                    return self._send(400, {"error": f"invalid {name}"})
+            jid = new_job(url, branch, subdir, task, body.get("mem", 0))
             JOBS[jid]["lang"] = self._ui_lang()
             threading.Thread(target=run_build, args=(jid,), daemon=True).start()
             return self._send(200, {"job_id": jid})
@@ -524,10 +555,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_OPTIONS(self):
+        # Pas de Access-Control-Allow-Origin : voir _from_browser / _send.
+        # Ce serveur n'est destine qu'au client HTTP natif de l'app APKforge.
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Build-Token")
         self.end_headers()
 
 def main():
