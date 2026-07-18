@@ -42,10 +42,8 @@ if [ -n "${PROOT_L2S:-}" ] || grep -qi 'proot' /proc/self/status 2>/dev/null; th
   exit 1
 fi
 
-echo "=== [2/6] Paquets Termux (jdk, wget, p7zip, python) ==="
-# python est requis par buildserver.py (le back-end HTTP pilote par l'app
-# APKforge), pas par la chaine de build elle-meme -> facile a oublier ici.
-pkg update -y && pkg install -y wget p7zip openjdk-21 python || {
+echo "=== [2/6] Paquets Termux (jdk, wget, p7zip) ==="
+pkg update -y && pkg install -y wget p7zip openjdk-21 || {
   echo "ERREUR: installation des paquets Termux a echoue."; exit 1; }
 
 echo "=== [3/6] SDK aarch64 (aapt2 ARM natif + platforms) ==="
