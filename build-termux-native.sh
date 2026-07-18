@@ -76,6 +76,17 @@ else
       git clone -q "$SRC" "$DEST"
     fi
   fi
+  # Initialise/actualise les submodules Git (ex: metroproto pour Metrolist).
+  # Un clone ou un pull normal ne recupere PAS le contenu des submodules : leur
+  # dossier reste vide, ce qui casse silencieusement les etapes de generation
+  # de code (protobuf, etc.) en aval et produit des erreurs de compilation
+  # difficiles a relier a la vraie cause. On le fait systematiquement, meme
+  # sur un repo deja clone (un submodule a pu etre ajoute depuis).
+  if [ -f "$DEST/.gitmodules" ]; then
+    echo "=== Initialisation des submodules Git ==="
+    git -C "$DEST" submodule update --init --recursive -q || \
+      echo "  ATTENTION: echec de l'initialisation des submodules (verifie le reseau)" >&2
+  fi
   PROJECT_DIR="$DEST"
 fi
 [ -n "$SUBDIR" ] && PROJECT_DIR="$PROJECT_DIR/$SUBDIR"
@@ -142,6 +153,8 @@ _print_diagnostics() {
   echo "  - 'daemon disappeared' / build tue -> manque de RAM ; baisse la memoire"
   echo "    dans APKforge, ou reessaie avec GRADLE_WORKERS=1"
   echo "  - dependance exige compileSdk plus recent -> sdkmanager 'platforms;android-NN'"
+  echo "  - fichier .proto/genere introuvable en cours de compilation -> submodule Git"
+  echo "    non initialise (verifie .gitmodules du projet, ou relance ce script)"
 }
 
 if ! run_gradle; then
