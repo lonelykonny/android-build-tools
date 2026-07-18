@@ -11,7 +11,6 @@
 #
 # Defaut : task = assembleDebug.
 # =============================================================================
-
 set -uo pipefail
 
 _ABT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +38,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2;;
     --subdir) SUBDIR="$2"; shift 2;;
-    --task)   TASK="$2";   shift 2;;
+    --task) TASK="$2"; shift 2;;
     *) shift;;
   esac
 done
@@ -100,7 +99,11 @@ printf "$(t build_step)\n" "$TASK" "$PROJECT_DIR"
 cd "$PROJECT_DIR"
 chmod +x gradlew
 
-GRADLE_EN_OPTS="-Duser.language=en -Duser.country=US"
+# -Djava.security.egd=file:/dev/./urandom : sur Termux/proot, /dev/random peut
+# manquer d'entropie et bloquer indefiniment la JVM des que SecureRandom est
+# sollicite (typiquement la signature de l'APK, tache packageDebug). On force
+# /dev/urandom (non bloquant) pour eviter un gel silencieux du build a ce stade.
+GRADLE_EN_OPTS="-Duser.language=en -Duser.country=US -Djava.security.egd=file:/dev/./urandom"
 
 # Garde-fou memoire pour mobile.
 # Si GRADLE_JVMARGS est fourni (par l'app APKforge via buildserver.py, ou en
