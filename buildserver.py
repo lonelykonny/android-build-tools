@@ -8,13 +8,13 @@
 # 127.0.0.1:8765 par defaut. L'app Android tape sur ce port via localhost.
 #
 # Endpoints :
-#   GET  /status                 -> etat de la chaine (chain ready ? sdk ? versions)
-#   POST /build  {url,branch,...} -> demarre un build, renvoie {job_id}
-#   GET  /logs/<job_id>?from=N    -> lignes de log a partir de l'index N (poll)
-#   GET  /jobs                    -> historique des builds
-#   GET  /job/<job_id>            -> etat d'un job (running/success/failed + apk)
-#   GET  /apk/<job_id>            -> telecharge l'APK produit
-#   POST /setup                   -> (re)lance setup-aapt2-qemu.sh
+#   GET  /status            -> etat de la chaine (chain ready ? sdk ? versions)
+#   POST /build {url,branch,...} -> demarre un build, renvoie {job_id}
+#   GET  /logs/<job_id>?from=N -> lignes de log a partir de l'index N (poll)
+#   GET  /jobs               -> historique des builds
+#   GET  /job/<job_id>       -> etat d'un job (running/success/failed + apk)
+#   GET  /apk/<job_id>       -> telecharge l'APK produit
+#   POST /setup               -> (re)lance setup-aapt2-qemu.sh
 #
 # Securite : bind sur 127.0.0.1 uniquement (pas exposé au reseau). Un token
 # simple peut etre exige via l'entete X-Build-Token (voir TOKEN ci-dessous).
@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOME = os.path.expanduser("~")
 TOOLS = os.path.join(HOME, "android-build-tools")
-BUILDER = os.path.join(TOOLS, "android-builder.sh")          # chaine proot (qemu)
+BUILDER = os.path.join(TOOLS, "android-builder.sh")            # chaine proot (qemu)
 NATIVE_BUILDER = os.path.join(TOOLS, "build-termux-native.sh")  # chaine native (sans qemu)
 SETUP = os.path.join(TOOLS, "setup-aapt2-qemu.sh")
 NATIVE_SETUP = os.path.join(TOOLS, "setup-termux-native.sh")
@@ -35,7 +35,9 @@ NATIVE_AAPT2 = os.path.join(HOME, "android-sdk", "build-tools", "35.0.0", "aapt2
 DEBIAN_ROOTFS = os.path.join(
     os.environ.get("PREFIX", "/data/data/com.termux/files/usr"),
     "var", "lib", "proot-distro", "containers", "debian")
+
 PORT = int(os.environ.get("BUILD_SERVER_PORT", "8765"))
+
 # token optionnel : si defini (env BUILD_SERVER_TOKEN), l'app doit l'envoyer.
 TOKEN = os.environ.get("BUILD_SERVER_TOKEN", "")
 
@@ -48,7 +50,7 @@ def _norm_lang(value):
 
 SERVER_MSG = {
     "launch_error": {"en": "[server] launch error: {e}", "fr": "[serveur] erreur lancement: {e}"},
-    "finished":     {"en": "[server] finished: {status}", "fr": "[serveur] termine: {status}"},
+    "finished": {"en": "[server] finished: {status}", "fr": "[serveur] termine: {status}"},
 }
 
 def srv(key, lang, **kw):
@@ -72,16 +74,26 @@ def _script_env(lang, mem=0):
 # On ne bascule QUE sur des erreurs liees a la CHAINE (aapt2/SDK/plateforme),
 # pas sur des erreurs du PROJET (Kotlin/Java cassent, deps introuvables) :
 # refaire en proot ne corrigerait pas un bug de code, ce serait du temps perdu.
+#
+# IMPORTANT : ces signatures doivent etre suffisamment specifiques pour ne PAS
+# matcher la sortie normale d'un build reussi-puis-echoue-ailleurs. L'ancienne
+# signature generique "aapt2" matchait par coincidence la ligne
+# "WARNING: ... android.aapt2FromMavenOverride=.../aapt2" qui apparait dans
+# TOUS les logs de la chaine native (succes ou echec), ce qui pouvait
+# declencher un fallback proot pour des raisons sans rapport avec aapt2.
+# On utilise desormais des messages d'erreur complets, pas des substrings de
+# chemin de fichier.
 CHAIN_ERROR_SIGNATURES = (
-    "failed to load include path",        # aapt2 ne lit pas android.jar
-    "android.jar",                        # plateforme manquante/incompatible
-    "exec format error",                  # binaire mauvaise architecture
-    "res_table_type_type",                # crash aapt2 sur la table de ressources
-    "requires compilesdk",                # compileSdk trop recent pour le natif
+    "failed to load include path",       # aapt2 ne lit pas android.jar
+    "loadedarsc.cpp",                    # parsing arsc casse (aapt2)
+    "res_table_type_type",               # crash aapt2 sur la table de ressources
+    "custom aapt2 location does not point",  # override aapt2 casse
+    "requires compilesdk",               # compileSdk trop recent pour le natif
     "requires compile sdk",
-    "loadedarsc",                         # parsing arsc casse
-    "aapt2",                              # erreur generique aapt2 (linking)
+    "syntax error: word unexpected",     # binaire build-tools x86 (aidl/zipalign/aapt)
+    "exec format error",                 # binaire mauvaise architecture
 )
+
 # Signatures d'erreur PROJET : si presentes, NE PAS basculer (echec legitime).
 PROJECT_ERROR_SIGNATURES = (
     "unresolved reference",
@@ -100,7 +112,6 @@ def fallback_warranted(lines):
         return False
     # Sinon, on bascule si une signature de chaine est presente.
     return any(sig in blob for sig in CHAIN_ERROR_SIGNATURES)
-
 
 # --- installation a la volee du fallback Debian ------------------------------
 # Constantes pour le bootstrap (lance cote TERMUX, hors du proot).
@@ -137,11 +148,9 @@ def install_debian_fallback(log):
     log(f"[server] echec installation Debian (rc={rc}).")
     return False
 
-
 # --- etat en memoire des jobs ------------------------------------------------
-JOBS = {}            # job_id -> dict(status, url, lines[], apk, started, ended)
+JOBS = {}  # job_id -> dict(status, url, lines[], apk, started, ended)
 JOBS_LOCK = threading.Lock()
-
 
 def new_job(url, branch, subdir, task, mem=0):
     jid = uuid.uuid4().hex[:12]
@@ -155,7 +164,6 @@ def new_job(url, branch, subdir, task, mem=0):
             "mem": int(mem) if mem else 0,
         }
     return jid
-
 
 def _run_chain(job, cmd, log):
     """Lance une commande de build, streame le log, renvoie (rc, lines_de_ce_run)."""
@@ -177,7 +185,6 @@ def _run_chain(job, cmd, log):
         run_lines = list(job["lines"][start_idx:])
     return rc, run_lines
 
-
 def _find_apk(url):
     repo_dir = os.path.join(HOME, "android-builds", os.path.basename(
         url.rstrip("/")).replace(".git", ""))
@@ -187,7 +194,6 @@ def _find_apk(url):
                 if f.endswith(".apk"):
                     return os.path.join(root, f)
     return None
-
 
 def run_build(jid):
     job = JOBS[jid]
@@ -210,7 +216,7 @@ def run_build(jid):
 
     rc = 1
     chain_used = None
-    do_proot = False   # decide-t-on de (re)tenter en proot ?
+    do_proot = False  # decide-t-on de (re)tenter en proot ?
 
     # --- 1) Tentative NATIVE (rapide, sans qemu) -----------------------------
     if native_ok:
@@ -255,10 +261,9 @@ def run_build(jid):
         job["apk"] = apk
         job["chain"] = chain_used
         job["ended"] = time.time()
-    log(srv("finished", job.get("lang"), status=job["status"])
-        + (f" [{chain_used}]" if chain_used else "")
-        + (f" apk={apk}" if apk else ""))
-
+        log(srv("finished", job.get("lang"), status=job["status"])
+            + (f" [{chain_used}]" if chain_used else "")
+            + (f" apk={apk}" if apk else ""))
 
 def chain_status():
     sdk = os.path.join(HOME, "android-sdk")
@@ -267,13 +272,12 @@ def chain_status():
     return {
         # 'chain_ready' reste vrai si AU MOINS une chaine est utilisable.
         "chain_ready": native_ready or proot_ready,
-        "native_ready": native_ready,    # chaine Termux native (aapt2 ARM, sans qemu)
-        "proot_ready": proot_ready,      # chaine proot Debian (qemu) en secours
+        "native_ready": native_ready,  # chaine Termux native (aapt2 ARM, sans qemu)
+        "proot_ready": proot_ready,    # chaine proot Debian (qemu) en secours
         "builder_present": os.path.exists(BUILDER) or os.path.exists(NATIVE_BUILDER),
         "sdk_present": os.path.isdir(sdk),
         "aapt2_native": NATIVE_AAPT2 if native_ready else None,
     }
-
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "AndroidBuildServer/1.0"
@@ -356,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.android.package-archive")
             self.send_header("Content-Disposition",
-                             f'attachment; filename="{os.path.basename(j["apk"])}"')
+                              f'attachment; filename="{os.path.basename(j["apk"])}"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -394,8 +398,8 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     setup_script = NATIVE_SETUP if os.path.exists(NATIVE_SETUP) else SETUP
                     proc = subprocess.Popen(["bash", setup_script], stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                            env=_script_env(job.get("lang")))
+                                             stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                             env=_script_env(job.get("lang")))
                     for line in proc.stdout:
                         with JOBS_LOCK:
                             job["lines"].append(line.rstrip("\n"))
@@ -421,7 +425,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Build-Token")
         self.end_headers()
 
-
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"[build-server] ecoute sur http://127.0.0.1:{PORT}")
@@ -432,7 +435,6 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[build-server] arret.")
-
 
 if __name__ == "__main__":
     main()
