@@ -159,6 +159,26 @@ _print_diagnostics() {
   echo "    generique bloque par le seccomp Android (clone3) ; patch automatique"
   echo "    tente vers l'equivalent natif Termux ; si tu vois ce message, il a echoue"
   echo "    (verifie que 'pkg install protobuf' fonctionne)"
+  echo "  - OutOfMemoryError pendant compileXxxKotlin -> heap du daemon Kotlin"
+  echo "    (kotlin.daemon.jvmargs) trop juste, souvent car plusieurs flavors"
+  echo "    compilent en parallele ; patch automatique tente (heap borne +"
+  echo "    workers=1) ; si tu vois ce message, baisse KOTLIN_DAEMON_XMX ou"
+  echo "    limite les flavors buildes (ex: --task assembleFossDebug)"
+}
+
+# Reduit le heap du daemon Kotlin et le parallelisme pour eviter l'OOM quand
+# plusieurs flavors (foss/gms...) compilent en meme temps sur un telephone.
+# kotlin.daemon.jvmargs est un reglage distinct de org.gradle.jvmargs : le
+# message d'erreur Gradle pointe explicitement cette cle, jamais fixee sinon.
+_patch_kotlin_daemon_oom() {
+  local xmx="${KOTLIN_DAEMON_XMX:-1536m}"
+  echo "  -> heap Kotlin insuffisant, fixe kotlin.daemon.jvmargs=-Xmx$xmx et reduit le parallelisme..."
+  local _GP="$HOME_DIR/.gradle/gradle.properties"
+  mkdir -p "$(dirname "$_GP")"
+  [ -f "$_GP" ] && sed -i '/^kotlin.daemon.jvmargs/d' "$_GP"
+  echo "kotlin.daemon.jvmargs=-Xmx$xmx" >> "$_GP"
+  GRADLE_WORKERS=1
+  return 0
 }
 
 # Remplace un ou plusieurs binaires "protoc" telecharges par le plugin Gradle
@@ -209,6 +229,18 @@ if ! run_gradle; then
     echo "$(t build_retry)"
     echo "  -> protoc/outil telecharge tue par SIGSYS (seccomp Android), bascule natif Termux et nouvel essai..."
     if _patch_protoc_seccomp && run_gradle; then
+      : # succes au 2e essai, on continue normalement plus bas
+    else
+      _print_diagnostics
+      exit 1
+    fi
+  # Cas cible : le daemon Kotlin manque de heap (souvent plusieurs flavors
+  # compiles en parallele sur un telephone). On borne kotlin.daemon.jvmargs,
+  # on repasse a un seul worker, et on retente UNE fois.
+  elif grep -qiE "outofmemoryerror|kotlin\.daemon\.jvmargs" "$_gradle_log"; then
+    echo "$(t build_retry)"
+    echo "  -> OutOfMemoryError du daemon Kotlin, heap reduit et nouvel essai..."
+    if _patch_kotlin_daemon_oom && run_gradle; then
       : # succes au 2e essai, on continue normalement plus bas
     else
       _print_diagnostics
