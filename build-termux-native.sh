@@ -11,6 +11,7 @@
 #
 # Defaut : task = assembleDebug.
 # =============================================================================
+
 set -uo pipefail
 
 _ABT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,19 +39,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2;;
     --subdir) SUBDIR="$2"; shift 2;;
-    --task) TASK="$2"; shift 2;;
+    --task)   TASK="$2";   shift 2;;
     *) shift;;
-  esac
-done
-
-# Garde-fou : une valeur commencant par '-' pourrait etre interpretee comme une
-# option par git (ex: une "URL" "--upload-pack=..." ferait executer une commande
-# arbitraire via git clone). Aucune URL/branche/sous-dossier legitime ne
-# commence par un tiret : on rejette ces valeurs plutot que de les transmettre
-# telles quelles a git.
-for _v in "$SRC" "$BRANCH" "$SUBDIR" "$TASK"; do
-  case "$_v" in
-    -*) echo "ERREUR: argument invalide (commence par '-'): $_v" >&2; exit 1 ;;
   esac
 done
 
@@ -76,17 +66,6 @@ else
       git clone -q "$SRC" "$DEST"
     fi
   fi
-  # Initialise/actualise les submodules Git (ex: metroproto pour Metrolist).
-  # Un clone ou un pull normal ne recupere PAS le contenu des submodules : leur
-  # dossier reste vide, ce qui casse silencieusement les etapes de generation
-  # de code (protobuf, etc.) en aval et produit des erreurs de compilation
-  # difficiles a relier a la vraie cause. On le fait systematiquement, meme
-  # sur un repo deja clone (un submodule a pu etre ajoute depuis).
-  if [ -f "$DEST/.gitmodules" ]; then
-    echo "=== Initialisation des submodules Git ==="
-    git -C "$DEST" submodule update --init --recursive -q || \
-      echo "  ATTENTION: echec de l'initialisation des submodules (verifie le reseau)" >&2
-  fi
   PROJECT_DIR="$DEST"
 fi
 [ -n "$SUBDIR" ] && PROJECT_DIR="$PROJECT_DIR/$SUBDIR"
@@ -110,11 +89,7 @@ printf "$(t build_step)\n" "$TASK" "$PROJECT_DIR"
 cd "$PROJECT_DIR"
 chmod +x gradlew
 
-# -Djava.security.egd=file:/dev/./urandom : sur Termux/proot, /dev/random peut
-# manquer d'entropie et bloquer indefiniment la JVM des que SecureRandom est
-# sollicite (typiquement la signature de l'APK, tache packageDebug). On force
-# /dev/urandom (non bloquant) pour eviter un gel silencieux du build a ce stade.
-GRADLE_EN_OPTS="-Duser.language=en -Duser.country=US -Djava.security.egd=file:/dev/./urandom"
+GRADLE_EN_OPTS="-Duser.language=en -Duser.country=US"
 
 # Garde-fou memoire pour mobile.
 # Si GRADLE_JVMARGS est fourni (par l'app APKforge via buildserver.py, ou en
@@ -153,56 +128,9 @@ _print_diagnostics() {
   echo "  - 'daemon disappeared' / build tue -> manque de RAM ; baisse la memoire"
   echo "    dans APKforge, ou reessaie avec GRADLE_WORKERS=1"
   echo "  - dependance exige compileSdk plus recent -> sdkmanager 'platforms;android-NN'"
-  echo "  - fichier .proto/genere introuvable en cours de compilation -> submodule Git"
-  echo "    non initialise (verifie .gitmodules du projet, ou relance ce script)"
-  echo "  - protoc/outil telecharge tue par SIGSYS (exit 159) -> binaire glibc"
-  echo "    generique bloque par le seccomp Android (clone3) ; patch automatique"
-  echo "    tente vers l'equivalent natif Termux ; si tu vois ce message, il a echoue"
-  echo "    (verifie que 'pkg install protobuf' fonctionne)"
-  echo "  - OutOfMemoryError pendant compileXxxKotlin -> heap du daemon Kotlin"
-  echo "    (kotlin.daemon.jvmargs) trop juste, souvent car plusieurs flavors"
-  echo "    compilent en parallele ; patch automatique tente (heap borne +"
-  echo "    workers=1) ; si tu vois ce message, baisse KOTLIN_DAEMON_XMX ou"
-  echo "    limite les flavors buildes (ex: --task assembleFossDebug)"
-}
-
-# Reduit le heap du daemon Kotlin et le parallelisme pour eviter l'OOM quand
-# plusieurs flavors (foss/gms...) compilent en meme temps sur un telephone.
-# kotlin.daemon.jvmargs est un reglage distinct de org.gradle.jvmargs : le
-# message d'erreur Gradle pointe explicitement cette cle, jamais fixee sinon.
-_patch_kotlin_daemon_oom() {
-  local xmx="${KOTLIN_DAEMON_XMX:-1536m}"
-  echo "  -> heap Kotlin insuffisant, fixe kotlin.daemon.jvmargs=-Xmx$xmx et reduit le parallelisme..."
-  local _GP="$HOME_DIR/.gradle/gradle.properties"
-  mkdir -p "$(dirname "$_GP")"
-  [ -f "$_GP" ] && sed -i '/^kotlin.daemon.jvmargs/d' "$_GP"
-  echo "kotlin.daemon.jvmargs=-Xmx$xmx" >> "$_GP"
-  GRADLE_WORKERS=1
-  return 0
-}
-
-# Remplace un ou plusieurs binaires "protoc" telecharges par le plugin Gradle
-# protobuf (generiques glibc/Linux, non compiles pour Termux) par le protoc
-# natif Termux. Ces binaires generiques utilisent des appels systeme (clone3,
-# rseq) que le filtre seccomp impose par Android aux process d'application
-# bloque -> le process meurt avec SIGSYS (exit 159) des son lancement. Les
-# paquets Termux, compiles specifiquement pour cet environnement, n'ont pas
-# ce probleme.
-_patch_protoc_seccomp() {
-  if ! command -v protoc >/dev/null 2>&1; then
-    echo "  -> installation du protoc natif Termux (pkg install protobuf)..."
-    pkg install -y protobuf || {
-      echo "  echec: impossible d'installer 'protobuf' via pkg" >&2
-      return 1
-    }
-  fi
-  local native_protoc found=0 bin
-  native_protoc="$(command -v protoc)"
-  while IFS= read -r -d '' bin; do
-    ln -sf "$native_protoc" "$bin"
-    found=1
-  done < <(find "$PROJECT_DIR" -type f -path '*/build/protoc/protoc-*' -print0 2>/dev/null)
-  [ "$found" -eq 1 ]
+  echo "  - toolchain Java absente (languageVersion=NN introuvable) -> patch automatique"
+  echo "    tente (declaration des JDK Termux dans gradle.properties) ; si tu vois ce"
+  echo "    message, il a echoue (installe le JDK requis : pkg install openjdk-NN)"
 }
 
 if ! run_gradle; then
@@ -221,26 +149,11 @@ if ! run_gradle; then
       _print_diagnostics
       exit 1
     fi
-  # Cas cible : un outil telecharge par Gradle (typiquement protoc du plugin
-  # protobuf) est un binaire glibc generique tue par le seccomp Android des
-  # son execution (SIGSYS / exit 159). On le remplace par l'equivalent natif
-  # Termux et on retente UNE fois.
-  elif grep -qiE "sigsys|exit value 159" "$_gradle_log"; then
+  elif grep -qE "Cannot find a Java installation|Toolchain download repositories have not been configured" "$_gradle_log"; then
     echo "$(t build_retry)"
-    echo "  -> protoc/outil telecharge tue par SIGSYS (seccomp Android), bascule natif Termux et nouvel essai..."
-    if _patch_protoc_seccomp && run_gradle; then
-      : # succes au 2e essai, on continue normalement plus bas
-    else
-      _print_diagnostics
-      exit 1
-    fi
-  # Cas cible : le daemon Kotlin manque de heap (souvent plusieurs flavors
-  # compiles en parallele sur un telephone). On borne kotlin.daemon.jvmargs,
-  # on repasse a un seul worker, et on retente UNE fois.
-  elif grep -qiE "outofmemoryerror|kotlin\.daemon\.jvmargs" "$_gradle_log"; then
-    echo "$(t build_retry)"
-    echo "  -> OutOfMemoryError du daemon Kotlin, heap reduit et nouvel essai..."
-    if _patch_kotlin_daemon_oom && run_gradle; then
+    echo "  -> toolchain Java manquante detectee (languageVersion), patch et nouvel essai..."
+    source "$_ABT_DIR/patch-jdk-toolchain.sh"
+    if patch_jdk_toolchain "$PROJECT_DIR" && run_gradle; then
       : # succes au 2e essai, on continue normalement plus bas
     else
       _print_diagnostics
