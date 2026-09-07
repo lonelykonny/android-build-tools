@@ -11,12 +11,31 @@
 
 patch_jdk_toolchain() {
     local project_dir="$1"
+    local gradle_log="${2:-}"
     local gradle_props="$project_dir/gradle.properties"
 
     local jdk_paths=()
     for d in "$PREFIX"/opt/openjdk-*; do
         [ -d "$d" ] && jdk_paths+=("$d")
     done
+
+    # Aucun JDK trouve : tente d'installer automatiquement la version exigee
+    # par Gradle, extraite du log ("languageVersion=17" etc.).
+    if [ ${#jdk_paths[@]} -eq 0 ] && [ -n "$gradle_log" ] && [ -f "$gradle_log" ]; then
+        local required_version
+        required_version="$(grep -oE 'languageVersion=[0-9]+' "$gradle_log" | head -n1 | cut -d= -f2)"
+        if [ -n "$required_version" ]; then
+            echo "[patch] JDK $required_version requis mais absent, tentative d'installation..."
+            if pkg install -y "openjdk-$required_version"; then
+                echo "[patch] openjdk-$required_version installe."
+            else
+                echo "[patch] echec de 'pkg install openjdk-$required_version'"
+            fi
+            for d in "$PREFIX"/opt/openjdk-*; do
+                [ -d "$d" ] && jdk_paths+=("$d")
+            done
+        fi
+    fi
 
     if [ ${#jdk_paths[@]} -eq 0 ]; then
         echo "[patch] aucun JDK Termux trouve sous \$PREFIX/opt -> patch toolchain impossible"

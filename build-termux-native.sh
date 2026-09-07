@@ -153,7 +153,7 @@ if ! run_gradle; then
     echo "$(t build_retry)"
     echo "  -> toolchain Java manquante detectee (languageVersion), patch et nouvel essai..."
     source "$_ABT_DIR/patch-jdk-toolchain.sh"
-    if patch_jdk_toolchain "$PROJECT_DIR" && run_gradle; then
+    if patch_jdk_toolchain "$PROJECT_DIR" "$_gradle_log" && run_gradle; then
       : # succes au 2e essai, on continue normalement plus bas
     else
       _print_diagnostics
